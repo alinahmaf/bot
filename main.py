@@ -10,7 +10,13 @@ from pathlib import Path
 from threading import Thread
 from flask import Flask
 
-TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = 8712142862
+
+TOKEN = os.environ.get("BOT_TOKEN", "").strip().strip('"').strip("'")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
+print(f"TOKEN OK len={len(TOKEN)}", flush=True)
+
 API_URL = f"https://api.telegram.org/bot{TOKEN}/"
 PRICE_WA = 5
 PRICE_TG = 10
@@ -22,6 +28,24 @@ BTN_BUY = "💰 اشتري رقم"
 BTN_WA = f"📱 واتساب - {PRICE_WA} ⭐"
 BTN_TG = f"✈️ تيليجرام - {PRICE_TG} ⭐"
 BTN_BACK = "⬅️ رجوع"
+
+WELCOME_MSG = """
+✨ أهلاً وسهلاً ببوت الأرقام 🇸🇾
+
+🔥 أرقام جاهزة - تسليم فوري ⚡️
+
+📦 شو عنا؟
+├ 📱 أرقام واتساب
+├ ✈️ أرقام تيليجرام
+└ ✅ نضيفة ومجربة
+
+💎 المميزات:
+✅ تسليم لحظي بعد الدفع
+✅ ضمان شغال
+✅ دعم 24/7
+
+👇 اضغط 💰 اشتري رقم وبلش!
+"""
 
 app = Flask("telegram_bot")
 @app.get("/")
@@ -35,10 +59,14 @@ def keep_alive():
 class TelegramAPIError(RuntimeError): pass
 def api_call(method, payload=None, timeout=30):
     body = json.dumps(payload or {}).encode("utf-8")
-    req = urllib.request.Request(API_URL + method, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(API_URL + method, data=body, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 TelegramBot"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()[:500] if hasattr(e, 'read') else str(e)
+        print(f"HTTPError {e.code}: {err_body}", flush=True)
+        raise TelegramAPIError(f"{e.code} {err_body}")
     except Exception as e:
         raise TelegramAPIError(str(e))
     if not res.get("ok"): raise TelegramAPIError(res.get("description"))
@@ -59,8 +87,6 @@ def initialize_database():
             CREATE TABLE IF NOT EXISTS payments (charge_id TEXT PRIMARY KEY, payload TEXT NOT NULL, number TEXT NOT NULL, user_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
-        conn.execute("INSERT OR IGNORE INTO inventory(number, type) VALUES (?, 'whatsapp')", ("+963944111111",))
-        conn.execute("INSERT OR IGNORE INTO inventory(number, type) VALUES (?, 'telegram')", ("+963944222222",))
         conn.execute("INSERT OR IGNORE INTO bot_state(key, value) VALUES ('last_update_id', '0')")
 
 def available_count(conn, typ):
@@ -80,10 +106,10 @@ def send_message(chat_id, text, markup=None):
 def send_invoice(chat_id, user_id, num_type):
     payload = uuid.uuid4().hex
     amount = PRICE_WA if num_type == "whatsapp" else PRICE_TG
-    title = "رقم واتساب" if num_type == "whatsapp" else "رقم تيليجرام"
+    title = "📱 رقم واتساب" if num_type == "whatsapp" else "✈️ رقم تيليجرام"
     with database() as conn:
         conn.execute("INSERT INTO orders(payload, user_id, status, created_at, type, amount) VALUES (?, ?, 'created', ?, ?, ?)", (payload, user_id, time.time(), num_type, amount))
-    api_call("sendInvoice", {"chat_id": chat_id, "title": title, "description": f"تسليم فوري - {title}", "payload": payload, "provider_token": "", "currency": "XTR", "prices": [{"label": title, "amount": amount}]})
+    api_call("sendInvoice", {"chat_id": chat_id, "title": title, "description": f"⚡️ تسليم فوري - {title}", "payload": payload, "provider_token": "", "currency": "XTR", "prices": [{"label": title, "amount": amount}]})
 
 def answer_pre_checkout(q):
     qid = q["id"]; payload = q.get("invoice_payload",""); uid = q.get("from",{}).get("id")
@@ -102,7 +128,7 @@ def answer_pre_checkout(q):
                         conn.execute("UPDATE orders SET status='reserved' WHERE payload=?", (payload,))
                         ok=True
     ans = {"pre_checkout_query_id": qid, "ok": ok}
-    if not ok: ans["error_message"]="الرقم غير متوفر او السعر خطأ"
+    if not ok: ans["error_message"]="❌ الرقم غير متوفر حالياً"
     api_call("answerPreCheckoutQuery", ans)
 
 def process_payment(msg):
@@ -116,35 +142,75 @@ def process_payment(msg):
             order = conn.execute("SELECT user_id, status, amount FROM orders WHERE payload=?", (payload,)).fetchone()
             if order and order["user_id"]==uid and pay.get("total_amount")==order["amount"]:
                 stock = conn.execute("SELECT number FROM inventory WHERE payload=?", (payload,)).fetchone()
-                if not stock: stock = conn.execute("SELECT number FROM inventory WHERE status='available' LIMIT 1").fetchone()
+                if not stock: stock = conn.execute("SELECT number FROM inventory WHERE status='available' AND type=? LIMIT 1", (order["type"],)).fetchone()
                 if stock:
                     number=stock["number"]
                     conn.execute("UPDATE inventory SET status='sold', payload=?, reserved_at=NULL WHERE number=?", (payload, number))
                     conn.execute("UPDATE orders SET status='paid' WHERE payload=?", (payload,))
                     conn.execute("INSERT INTO payments(charge_id, payload, number, user_id) VALUES (?,?,?,?)", (charge_id, payload, number, uid))
-    if number: send_message(chat_id, f"✅ تم الدفع!\n\nرقمك:\n{number}", {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
+    if number:
+        send_message(chat_id, f"✅ تم الدفع بنجاح! 🎉\n\n📱 رقمك:\n{number}\n\n💡 انسخ الرقم واستخدمو فوراً\n🙏 شكراً لثقتك ❤️", {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
     else:
         if uid and charge_id:
             api_call("refundStarPayment", {"user_id": uid, "telegram_payment_charge_id": charge_id})
-            if chat_id: send_message(chat_id, "تعذر التسليم وتم ارجاع النجوم.")
+            if chat_id: send_message(chat_id, "❌ تعذر التسليم وتم ارجاع النجوم ⭐")
 
 def handle_update(upd):
     if "pre_checkout_query" in upd: answer_pre_checkout(upd["pre_checkout_query"]); return
     msg = upd.get("message",{}); chat_id = msg.get("chat",{}).get("id"); uid = msg.get("from",{}).get("id")
     if not chat_id: return
     if "successful_payment" in msg: process_payment(msg); return
-    text = msg.get("text","")
+    text = msg.get("text","").strip()
+
+    if uid == ADMIN_ID:
+        if text.startswith("/add"):
+            try:
+                parts = text.split()
+                num = parts[1]
+                typ = parts[2].lower()
+                if typ not in ("whatsapp", "telegram"): typ = "whatsapp"
+                with database() as c:
+                    c.execute("INSERT OR IGNORE INTO inventory(number, type) VALUES (?, ?)", (num, typ))
+                    c.commit()
+                send_message(chat_id, f"✅ تم اضافة\n{num}\nنوع: {typ}")
+            except:
+                send_message(chat_id, "❌ الصيغة:\n/add +963944123456 whatsapp")
+            return
+        if text == "/stock":
+            with database() as c:
+                wa = c.execute("SELECT COUNT(*) FROM inventory WHERE status='available' AND type='whatsapp'").fetchone()[0]
+                tg = c.execute("SELECT COUNT(*) FROM inventory WHERE status='available' AND type='telegram'").fetchone()[0]
+                all_nums = c.execute("SELECT number, type, status FROM inventory ORDER BY type LIMIT 20").fetchall()
+            txt = f"📦 المخزون:\nواتساب: {wa}\nتيليجرام: {tg}\n\n"
+            for r in all_nums:
+                txt += f"{r['number']} - {r['type']} - {r['status']}\n"
+            send_message(chat_id, txt)
+            return
+        if text == "/clear":
+            with database() as c:
+                c.execute("DELETE FROM inventory")
+                c.commit()
+            send_message(chat_id, "🗑️ تم مسح المخزون")
+            return
+
     if text in ("/start","/help"):
-        with database() as c: wa = available_count(c,'whatsapp'); tg = available_count(c,'telegram')
-        send_message(chat_id, f"📞 بوت بيع الأرقام\n\n{BTN_WA} - متوفر: {wa}\n{BTN_TG} - متوفر: {tg}\n\nاضغط اشتري رقم للبدء", {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
+        send_message(chat_id, WELCOME_MSG, {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
     elif text == BTN_BUY:
-        send_message(chat_id, "اختار نوع الرقم:", {"keyboard": [[{"text": BTN_WA}, {"text": BTN_TG}], [{"text": BTN_BACK}]], "resize_keyboard": True})
+        send_message(chat_id, "👇 اختار نوع الرقم:", {"keyboard": [[{"text": BTN_WA}, {"text": BTN_TG}], [{"text": BTN_BACK}]], "resize_keyboard": True})
     elif text == BTN_WA and uid:
-        send_invoice(chat_id, uid, "whatsapp")
+        with database() as c: cnt = available_count(c, 'whatsapp')
+        if cnt == 0:
+            send_message(chat_id, "😔 أرقام الواتساب خلصت حالياً، رح نضيف قريباً 🙏")
+        else:
+            send_invoice(chat_id, uid, "whatsapp")
     elif text == BTN_TG and uid:
-        send_invoice(chat_id, uid, "telegram")
+        with database() as c: cnt = available_count(c, 'telegram')
+        if cnt == 0:
+            send_message(chat_id, "😔 أرقام التيليجرام خلصت حالياً، رح نضيف قريباً 🙏")
+        else:
+            send_invoice(chat_id, uid, "telegram")
     elif text == BTN_BACK:
-        send_message(chat_id, "القائمة الرئيسية", {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
+        send_message(chat_id, "🏠 القائمة الرئيسية", {"keyboard": [[{"text": BTN_BUY}]], "resize_keyboard": True})
 
 def run():
     initialize_database(); keep_alive()
